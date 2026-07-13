@@ -3,6 +3,7 @@ import * as XLSX from "xlsx";
 import {
   Plus, Trash2, TrendingUp, TrendingDown, Wallet, ChevronLeft, ChevronRight,
   Pencil, X, Check, Download, Upload, FileSpreadsheet, ListChecks, LayoutGrid,
+  ClipboardPaste, AlertTriangle,
 } from "lucide-react";
 
 const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
@@ -14,29 +15,24 @@ const fmtCLP = (n) =>
   new Intl.NumberFormat("es-CL", { style: "currency", currency: "CLP", maximumFractionDigits: 0 }).format(n || 0);
 const fmtPct = (n) => (n === null ? "—" : `${Math.round(n * 100)}%`);
 
+// Convierte "01/07/2026" -> "2026-07-01". Devuelve null si no calza el formato.
+const parsearFechaDDMMYYYY = (raw) => {
+  const m = raw.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  const [, d, mo, y] = m;
+  return `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+};
+
+// Convierte "15,000" o "38.556" o "15000" -> 15000. Devuelve null si queda vacío.
+const parsearMonto = (raw) => {
+  const limpio = raw.replace(/[.,\s]/g, "").trim();
+  if (!limpio) return null;
+  const val = parseInt(limpio, 10);
+  return isNaN(val) ? null : val;
+};
+
 const K_CATS = "depto505:categorias";
 const K_MOVS = "depto505:movimientos";
-
-// Adaptador de almacenamiento local (reemplaza window.storage, propio del entorno de artifacts).
-// Guarda en localStorage del navegador — persiste solo en este dispositivo/navegador.
-const storage = {
-  async get(key) {
-    try {
-      const raw = window.localStorage.getItem(key);
-      return raw === null ? null : { key, value: raw };
-    } catch {
-      return null;
-    }
-  },
-  async set(key, value) {
-    try {
-      window.localStorage.setItem(key, value);
-      return { key, value };
-    } catch {
-      return null;
-    }
-  },
-};
 
 const SEED_CATEGORIAS = [
   { id: "c1", tipo: "gasto", nombre: "Peaje (ida y vuelta)", presupuesto: 0 },
@@ -80,12 +76,21 @@ export default function FinanzasDepto505() {
   const [editNombreId, setEditNombreId] = useState(null);
   const [editNombreVal, setEditNombreVal] = useState("");
 
+  const [mostrarPegar, setMostrarPegar] = useState(false);
+  const [textoPegado, setTextoPegado] = useState("");
+  const [pegarResultado, setPegarResultado] = useState(null); // { filasValidas, filasInvalidas, categoriasNuevas }
+  const [tiposCategoriasNuevas, setTiposCategoriasNuevas] = useState({}); // { nombreCategoria: "gasto" | "ingreso" }
+
+  const [editMovId, setEditMovId] = useState(null);
+  const [editMovDraft, setEditMovDraft] = useState({ fecha: "", categoriaId: "", descripcion: "", monto: "" });
+  const [confirmAccion, setConfirmAccion] = useState(null); // { tipo: "mes" | "todo", mensaje }
+
   useEffect(() => {
     (async () => {
       try {
         const [c, m] = await Promise.all([
-          storage.get(K_CATS).catch(() => null),
-          storage.get(K_MOVS).catch(() => null),
+          window.storage.get(K_CATS, false).catch(() => null),
+          window.storage.get(K_MOVS, false).catch(() => null),
         ]);
         setCategorias(c ? JSON.parse(c.value) : SEED_CATEGORIAS);
         setMovimientos(m ? JSON.parse(m.value) : []);
@@ -99,7 +104,7 @@ export default function FinanzasDepto505() {
   const guardarCategorias = async (next) => {
     setCategorias(next);
     try {
-      const res = await storage.set(K_CATS, JSON.stringify(next));
+      const res = await window.storage.set(K_CATS, JSON.stringify(next), false);
       if (!res) setError("No se pudo guardar. Intenta de nuevo.");
       else setError(null);
     } catch {
@@ -110,7 +115,7 @@ export default function FinanzasDepto505() {
   const guardarMovimientos = async (next) => {
     setMovimientos(next);
     try {
-      const res = await storage.set(K_MOVS, JSON.stringify(next));
+      const res = await window.storage.set(K_MOVS, JSON.stringify(next), false);
       if (!res) setError("No se pudo guardar. Intenta de nuevo.");
       else setError(null);
     } catch {
@@ -138,7 +143,7 @@ export default function FinanzasDepto505() {
 
   const agregarMovimiento = (e) => {
     e.preventDefault();
-    const monto = parseFloat(nuevo.monto);
+    const monto = parsearMonto(nuevo.monto);
     if (!monto || monto <= 0 || !nuevo.categoriaId) return;
     const cat = catMap[nuevo.categoriaId];
     if (!cat) return;
@@ -158,6 +163,141 @@ export default function FinanzasDepto505() {
     guardarMovimientos((movimientos || []).filter((m) => m.id !== id));
   };
 
+  const vaciarMesActual = () => {
+    const cantidad = movsDelMes.length;
+    if (cantidad === 0) return;
+    setConfirmAccion({
+      tipo: "mes",
+      mensaje: `¿Borrar los ${cantidad} movimiento(s) de ${monthLabel(cursor)}? Esto no se puede deshacer.`,
+    });
+  };
+
+  const borrarTodosLosMovimientos = () => {
+    const cantidad = (movimientos || []).length;
+    if (cantidad === 0) return;
+    setConfirmAccion({
+      tipo: "todo",
+      mensaje: `¿Borrar TODOS los movimientos (${cantidad} en total, de todos los meses)? Las categorías no se tocan. Esto no se puede deshacer.`,
+    });
+  };
+
+  const ejecutarConfirmAccion = () => {
+    if (!confirmAccion) return;
+    if (confirmAccion.tipo === "mes") {
+      guardarMovimientos((movimientos || []).filter((m) => m.fecha.slice(0, 7) !== cursor));
+    } else if (confirmAccion.tipo === "todo") {
+      guardarMovimientos([]);
+    }
+    setConfirmAccion(null);
+  };
+
+  const empezarEdicionMovimiento = (m) => {
+    setEditMovId(m.id);
+    setEditMovDraft({ fecha: m.fecha, categoriaId: m.categoriaId, descripcion: m.descripcion || "", monto: String(m.monto) });
+  };
+
+  const cancelarEdicionMovimiento = () => {
+    setEditMovId(null);
+    setEditMovDraft({ fecha: "", categoriaId: "", descripcion: "", monto: "" });
+  };
+
+  const guardarEdicionMovimiento = () => {
+    const monto = parsearMonto(editMovDraft.monto);
+    const cat = catMap[editMovDraft.categoriaId];
+    if (!monto || monto <= 0 || !cat || !editMovDraft.fecha) return;
+    guardarMovimientos(
+      (movimientos || []).map((m) =>
+        m.id === editMovId
+          ? { ...m, fecha: editMovDraft.fecha, categoriaId: cat.id, tipo: cat.tipo, descripcion: editMovDraft.descripcion.trim(), monto }
+          : m
+      )
+    );
+    cancelarEdicionMovimiento();
+  };
+
+  // Toma el texto pegado (filas copiadas de Excel, separadas por tabulaciones) y arma
+  // una previsualización: filas válidas, filas inválidas (sin fecha o monto reconocible),
+  // y las categorías mencionadas que no existen todavía en la app.
+  const procesarTextoPegado = () => {
+    const nombresConocidos = new Map((categorias || []).map((c) => [c.nombre.trim().toLowerCase(), c]));
+    const lineas = textoPegado.split("\n").map((l) => l.replace(/\t+$/, "")).filter((l) => l.trim() !== "");
+
+    const filasValidas = [];
+    const filasInvalidas = [];
+    const nuevasVistas = new Map(); // nombre original -> true
+
+    lineas.forEach((linea, i) => {
+      const partes = linea.split("\t").map((p) => p.trim());
+      const [fechaRaw, categoriaRaw, descripcionRaw, montoRaw] = partes;
+      const fecha = fechaRaw ? parsearFechaDDMMYYYY(fechaRaw) : null;
+      const monto = montoRaw ? parsearMonto(montoRaw) : null;
+
+      if (!fecha || !categoriaRaw || !monto) {
+        filasInvalidas.push({ n: i + 1, texto: linea, motivo: !fecha ? "fecha no reconocida" : !categoriaRaw ? "sin categoría" : "sin monto válido" });
+        return;
+      }
+
+      const catExistente = nombresConocidos.get(categoriaRaw.trim().toLowerCase());
+      if (!catExistente) nuevasVistas.set(categoriaRaw.trim(), true);
+
+      filasValidas.push({
+        fecha,
+        categoriaNombre: categoriaRaw.trim(),
+        descripcion: (descripcionRaw || "").trim(),
+        monto,
+        categoriaId: catExistente ? catExistente.id : null,
+        tipoExistente: catExistente ? catExistente.tipo : null,
+      });
+    });
+
+    const categoriasNuevas = Array.from(nuevasVistas.keys());
+    setTiposCategoriasNuevas(Object.fromEntries(categoriasNuevas.map((n) => [n, "gasto"])));
+    setPegarResultado({ filasValidas, filasInvalidas, categoriasNuevas });
+  };
+
+  const confirmarPegado = () => {
+    if (!pegarResultado) return;
+    const { filasValidas, categoriasNuevas } = pegarResultado;
+
+    // 1) Crea las categorías nuevas que hicieron falta, con el tipo elegido en el panel.
+    const categoriasCreadas = categoriasNuevas.map((nombre, i) => ({
+      id: `c_pegado_${Date.now()}_${i}`,
+      tipo: tiposCategoriasNuevas[nombre] || "gasto",
+      nombre,
+      presupuesto: 0,
+    }));
+    const categoriasFinal = [...(categorias || []), ...categoriasCreadas];
+    const idPorNombre = new Map(categoriasFinal.map((c) => [c.nombre.trim().toLowerCase(), c]));
+
+    // 2) Arma los movimientos, resolviendo el id/tipo de categoría (existente o recién creada).
+    const nuevosMovimientos = filasValidas.map((f, i) => {
+      const cat = idPorNombre.get(f.categoriaNombre.toLowerCase());
+      return {
+        id: `mov_pegado_${Date.now()}_${i}`,
+        categoriaId: cat.id,
+        tipo: cat.tipo,
+        descripcion: f.descripcion,
+        monto: f.monto,
+        fecha: f.fecha,
+      };
+    });
+
+    guardarCategorias(categoriasFinal);
+    guardarMovimientos([...nuevosMovimientos, ...(movimientos || [])]);
+
+    setTextoPegado("");
+    setPegarResultado(null);
+    setTiposCategoriasNuevas({});
+    setMostrarPegar(false);
+  };
+
+  const cancelarPegado = () => {
+    setTextoPegado("");
+    setPegarResultado(null);
+    setTiposCategoriasNuevas({});
+    setMostrarPegar(false);
+  };
+
   const crearCategoria = (e) => {
     e.preventDefault();
     if (!nuevaCat.nombre.trim()) return;
@@ -165,7 +305,7 @@ export default function FinanzasDepto505() {
       id: `c_${Date.now()}`,
       tipo: nuevaCat.tipo,
       nombre: nuevaCat.nombre.trim(),
-      presupuesto: parseFloat(nuevaCat.presupuesto) || 0,
+      presupuesto: parsearMonto(nuevaCat.presupuesto) || 0,
     };
     guardarCategorias([...(categorias || []), nueva]);
     setNuevaCat({ tipo: "gasto", nombre: "", presupuesto: "" });
@@ -182,8 +322,8 @@ export default function FinanzasDepto505() {
   };
 
   const actualizarPresupuesto = (id, valor) => {
-    const val = parseFloat(valor);
-    guardarCategorias((categorias || []).map((c) => (c.id === id ? { ...c, presupuesto: isNaN(val) ? 0 : val } : c)));
+    const val = parsearMonto(valor);
+    guardarCategorias((categorias || []).map((c) => (c.id === id ? { ...c, presupuesto: val === null ? 0 : val } : c)));
     setEditPresId(null);
   };
 
@@ -363,6 +503,22 @@ export default function FinanzasDepto505() {
           </button>
         ))}
         <div style={styles.monthNav}>
+          <button
+            style={{ ...styles.iconBtn, ...(mostrarPegar ? { background: "#1C2740", color: "#E7ECF5" } : {}) }}
+            onClick={() => setMostrarPegar((v) => !v)}
+            title="Pegar filas copiadas desde Excel"
+            aria-label="Pegar desde Excel"
+          >
+            <ClipboardPaste size={15} />
+          </button>
+          <button
+            style={{ ...styles.iconBtn, color: styles.coral }}
+            onClick={vaciarMesActual}
+            title={`Borrar todos los movimientos de ${monthLabel(cursor)}`}
+            aria-label="Borrar movimientos del mes"
+          >
+            <Trash2 size={15} />
+          </button>
           <button style={styles.iconBtn} onClick={exportarExcel} title="Exportar a Excel (estilo original)" aria-label="Exportar a Excel"><FileSpreadsheet size={15} /></button>
           <button style={styles.iconBtn} onClick={exportarBackup} title="Descargar backup (JSON)" aria-label="Descargar backup"><Download size={15} /></button>
           <button style={styles.iconBtn} onClick={() => fileInputRef.current?.click()} title="Restaurar backup (JSON)" aria-label="Restaurar backup"><Upload size={15} /></button>
@@ -375,6 +531,81 @@ export default function FinanzasDepto505() {
       </nav>
 
       {error && <div style={styles.errorBanner}>{error}</div>}
+
+      {mostrarPegar && (
+        <section style={styles.pegarPanel}>
+          <h3 style={styles.sectionTitle}>Pegar filas desde Excel</h3>
+          <p style={styles.hint}>
+            Copia las filas de tu planilla (fecha, categoría, descripción, monto — separadas por tabulación,
+            tal como las copia Excel) y pégalas acá abajo.
+          </p>
+          <textarea
+            value={textoPegado}
+            onChange={(e) => setTextoPegado(e.target.value)}
+            placeholder={"01/07/2026\tAseos externos - Peti\taseo\t15,000\n02/07/2026\tIngreso 1\tairbnb sur villa\t72571"}
+            style={styles.textarea}
+            rows={6}
+          />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={styles.addBtn} onClick={procesarTextoPegado} disabled={!textoPegado.trim()}>Revisar filas</button>
+            <button style={styles.secondaryBtn} onClick={cancelarPegado}>Cancelar</button>
+          </div>
+
+          {pegarResultado && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 4 }}>
+              <div style={styles.pegarResumen}>
+                <span style={{ color: styles.mint }}>{pegarResultado.filasValidas.length} movimiento(s) listos para agregar</span>
+                {pegarResultado.filasInvalidas.length > 0 && (
+                  <span style={{ color: styles.coral }}>{pegarResultado.filasInvalidas.length} fila(s) omitida(s)</span>
+                )}
+              </div>
+
+              {pegarResultado.categoriasNuevas.length > 0 && (
+                <div>
+                  <p style={styles.hint}>Estas categorías no existían — elige si son gasto o ingreso:</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {pegarResultado.categoriasNuevas.map((nombre) => (
+                      <div key={nombre} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <span style={{ fontSize: 13, minWidth: 180 }}>{nombre}</span>
+                        <div style={styles.segmented}>
+                          {["gasto", "ingreso"].map((t) => (
+                            <button
+                              type="button"
+                              key={t}
+                              onClick={() => setTiposCategoriasNuevas((f) => ({ ...f, [nombre]: t }))}
+                              style={{ ...styles.segmentBtn, ...(tiposCategoriasNuevas[nombre] === t ? { background: t === "gasto" ? styles.coral : styles.mint, color: "#0B1120" } : {}) }}
+                            >
+                              {t === "gasto" ? "Gasto" : "Ingreso"}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {pegarResultado.filasInvalidas.length > 0 && (
+                <div>
+                  <p style={styles.hint}>Filas omitidas (revisa formato de fecha o monto):</p>
+                  <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: "#8A94A8" }}>
+                    {pegarResultado.filasInvalidas.map((f) => (
+                      <li key={f.n}>Línea {f.n} — {f.motivo}: <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{f.texto}</span></li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <div style={{ display: "flex", gap: 8 }}>
+                <button style={styles.addBtn} onClick={confirmarPegado} disabled={pegarResultado.filasValidas.length === 0}>
+                  <Check size={16} /> Confirmar e importar
+                </button>
+                <button style={styles.secondaryBtn} onClick={cancelarPegado}>Cancelar</button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
 
       {tab === "registro" && (
         <main style={styles.main}>
@@ -421,7 +652,7 @@ export default function FinanzasDepto505() {
                   {categoriasDelTipo.map((c) => <option key={c.id} value={c.id}>{c.nombre}</option>)}
                 </select>
                 <input
-                  type="number" min="0" step="1" placeholder="Monto"
+                  type="text" inputMode="decimal" placeholder="Monto (ej: 15.000)"
                   value={nuevo.monto}
                   onChange={(e) => setNuevo((f) => ({ ...f, monto: e.target.value }))}
                   style={styles.inputNum} required
@@ -458,6 +689,46 @@ export default function FinanzasDepto505() {
                   {movsDelMes.slice().sort((a, b) => b.fecha.localeCompare(a.fecha)).map((m) => {
                     const c = catMap[m.categoriaId];
                     const accent = m.tipo === "ingreso" ? styles.mint : styles.coral;
+                    const enEdicion = editMovId === m.id;
+
+                    if (enEdicion) {
+                      return (
+                        <tr key={m.id}>
+                          <td style={styles.td}>
+                            <input type="date" value={editMovDraft.fecha} onChange={(e) => setEditMovDraft((f) => ({ ...f, fecha: e.target.value }))} style={styles.inputMini} />
+                          </td>
+                          <td style={styles.td}>
+                            <select
+                              value={editMovDraft.categoriaId}
+                              onChange={(e) => setEditMovDraft((f) => ({ ...f, categoriaId: e.target.value }))}
+                              style={{ ...styles.inputMini, fontFamily: "'Inter', sans-serif" }}
+                            >
+                              {categorias.map((cc) => <option key={cc.id} value={cc.id}>{cc.nombre}</option>)}
+                            </select>
+                          </td>
+                          <td style={styles.td}>
+                            <input type="text" value={editMovDraft.descripcion} onChange={(e) => setEditMovDraft((f) => ({ ...f, descripcion: e.target.value }))} style={styles.inputMini} />
+                          </td>
+                          <td style={{ ...styles.td, textAlign: "right" }}>
+                            <input
+                              type="text" inputMode="decimal"
+                              value={editMovDraft.monto}
+                              onChange={(e) => setEditMovDraft((f) => ({ ...f, monto: e.target.value }))}
+                              style={{ ...styles.inputMini, textAlign: "right" }}
+                              autoFocus
+                              onKeyDown={(e) => e.key === "Enter" && guardarEdicionMovimiento()}
+                            />
+                          </td>
+                          <td style={{ ...styles.td, textAlign: "right" }}>
+                            <div style={{ display: "flex", gap: 4, justifyContent: "flex-end" }}>
+                              <button onClick={guardarEdicionMovimiento} style={styles.miniIconBtn} aria-label="Guardar"><Check size={12} /></button>
+                              <button onClick={cancelarEdicionMovimiento} style={styles.miniIconBtn} aria-label="Cancelar"><X size={12} /></button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    }
+
                     return (
                       <tr key={m.id}>
                         <td style={styles.td}>{m.fecha}</td>
@@ -469,7 +740,10 @@ export default function FinanzasDepto505() {
                           {m.tipo === "ingreso" ? "+" : "−"}{fmtCLP(m.monto)}
                         </td>
                         <td style={{ ...styles.td, textAlign: "right" }}>
-                          <button onClick={() => eliminarMovimiento(m.id)} style={styles.deleteBtn} aria-label="Eliminar"><Trash2 size={14} /></button>
+                          <div style={{ display: "flex", gap: 4, justifyContent: "flex-end" }}>
+                            <button onClick={() => empezarEdicionMovimiento(m)} style={styles.deleteBtn} aria-label="Editar"><Pencil size={14} /></button>
+                            <button onClick={() => eliminarMovimiento(m.id)} style={styles.deleteBtn} aria-label="Eliminar"><Trash2 size={14} /></button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -541,10 +815,10 @@ export default function FinanzasDepto505() {
                 style={{ ...styles.inputDesc, minWidth: 200 }} required
               />
               <input
-                type="number" min="0" step="1" placeholder="Presupuesto ($CLP, opcional)"
+                type="text" inputMode="decimal" placeholder="Presupuesto (ej: 25.000, opcional)"
                 value={nuevaCat.presupuesto}
                 onChange={(e) => setNuevaCat((f) => ({ ...f, presupuesto: e.target.value }))}
-                style={{ ...styles.inputNum, width: 150 }}
+                style={{ ...styles.inputNum, width: 170 }}
               />
               <button type="submit" style={styles.addBtn}><Plus size={16} /> Crear</button>
             </div>
@@ -589,7 +863,7 @@ export default function FinanzasDepto505() {
                         {editPresId === c.id ? (
                           <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                             <input
-                              type="number" min="0"
+                              type="text" inputMode="decimal"
                               value={editPresVal}
                               onChange={(e) => setEditPresVal(e.target.value)}
                               style={{ ...styles.inputMini, width: 100 }}
@@ -615,7 +889,39 @@ export default function FinanzasDepto505() {
               </tbody>
             </table>
           </div>
+
+          <div style={styles.zonaPeligro}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <AlertTriangle size={16} color={styles.coral} />
+              <span style={{ ...styles.sectionTitle, color: styles.coral }}>Zona de peligro</span>
+            </div>
+            <p style={styles.hint}>
+              Borra todos los movimientos registrados, de todos los meses (útil si pegaste el mismo bloque de Excel
+              varias veces por error). Las categorías y sus presupuestos no se tocan.
+            </p>
+            <button style={styles.dangerBtn} onClick={borrarTodosLosMovimientos}>
+              <Trash2 size={14} /> Borrar todos los movimientos ({(movimientos || []).length})
+            </button>
+          </div>
         </main>
+      )}
+
+      {confirmAccion && (
+        <div style={styles.modalOverlay} onClick={() => setConfirmAccion(null)}>
+          <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <AlertTriangle size={18} color={styles.coral} />
+              <span style={{ ...styles.sectionTitle, fontSize: 15 }}>Confirmar borrado</span>
+            </div>
+            <p style={{ fontSize: 13, color: "#E7ECF5", margin: 0, lineHeight: 1.5 }}>{confirmAccion.mensaje}</p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={styles.secondaryBtn} onClick={() => setConfirmAccion(null)}>Cancelar</button>
+              <button style={styles.dangerBtn} onClick={ejecutarConfirmAccion}>
+                <Trash2 size={14} /> Sí, borrar
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -649,7 +955,7 @@ function ResumenTabla({ titulo, filas, accent, totalAcum, totalPresu, totalDif, 
                 {editPresId === f.id ? (
                   <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                     <input
-                      type="number" min="0"
+                      type="text" inputMode="decimal"
                       value={editPresVal}
                       onChange={(e) => setEditPresVal(e.target.value)}
                       style={{ ...styles.inputMini, width: 100 }}
@@ -719,6 +1025,14 @@ const styles = {
   monthLabel: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: "#E7ECF5", minWidth: 90, textAlign: "center", textTransform: "capitalize" },
   iconBtn: { background: "#131B2E", border: "1px solid #232E47", color: "#8A94A8", borderRadius: 6, width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" },
   errorBanner: { margin: "0 20px", marginTop: 12, padding: "8px 12px", background: "#2A1620", border: "1px solid #FF8A5B", color: "#FF8A5B", borderRadius: 8, fontSize: 12 },
+  pegarPanel: { margin: "12px 20px 0 20px", padding: 16, background: "#131B2E", border: "1px solid #232E47", borderRadius: 12, display: "flex", flexDirection: "column", gap: 10 },
+  textarea: { background: "#0B1120", color: "#E7ECF5", border: "1px solid #232E47", borderRadius: 8, padding: "10px 12px", fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", width: "100%", resize: "vertical" },
+  secondaryBtn: { background: "transparent", color: "#8A94A8", border: "1px solid #232E47", borderRadius: 8, padding: "9px 14px", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "'Space Grotesk', sans-serif" },
+  pegarResumen: { display: "flex", gap: 16, fontSize: 12, fontFamily: "'IBM Plex Mono', monospace" },
+  zonaPeligro: { border: "1px solid #4A2A2A", background: "#1A1315", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", gap: 8 },
+  dangerBtn: { display: "flex", alignItems: "center", gap: 6, alignSelf: "flex-start", background: "transparent", color: "#FF8A5B", border: "1px solid #FF8A5B", borderRadius: 8, padding: "8px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "'Space Grotesk', sans-serif" },
+  modalOverlay: { position: "fixed", inset: 0, background: "rgba(11,17,32,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 },
+  modalCard: { background: "#131B2E", border: "1px solid #232E47", borderRadius: 12, padding: 20, display: "flex", flexDirection: "column", gap: 14, maxWidth: 360, width: "100%" },
   main: { padding: 20, display: "flex", flexDirection: "column", gap: 20 },
   cardsRow: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 },
   card: { background: "#131B2E", border: "1px solid #232E47", borderRadius: 12, padding: 16 },
