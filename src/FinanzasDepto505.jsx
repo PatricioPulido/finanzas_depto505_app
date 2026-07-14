@@ -85,40 +85,59 @@ export default function FinanzasDepto505() {
   const [editMovDraft, setEditMovDraft] = useState({ fecha: "", categoriaId: "", descripcion: "", monto: "" });
   const [confirmAccion, setConfirmAccion] = useState(null); // { tipo: "mes" | "todo", mensaje }
 
+  // Carga inicial: se ejecuta UNA sola vez, al montar el componente ([] al final).
+  // localStorage es síncrono (a diferencia de window.storage), así que no
+  // necesitamos async/await ni Promise.all aquí.
   useEffect(() => {
-    (async () => {
-      try {
-        const [c, m] = await Promise.all([
-          window.storage.get(K_CATS, false).catch(() => null),
-          window.storage.get(K_MOVS, false).catch(() => null),
-        ]);
-        setCategorias(c ? JSON.parse(c.value) : SEED_CATEGORIAS);
-        setMovimientos(m ? JSON.parse(m.value) : []);
-      } catch {
-        setCategorias(SEED_CATEGORIAS);
-        setMovimientos([]);
-      }
-    })();
+    try {
+      // getItem devuelve un string si existe la key, o null si nunca se guardó nada.
+      const catGuardadas = localStorage.getItem(K_CATS);
+      const movGuardados = localStorage.getItem(K_MOVS);
+
+      // Si hay algo guardado (no es null), lo convertimos de texto a objeto/array
+      // con JSON.parse. Si no hay nada (primera vez que se abre la app en este
+      // navegador), usamos las categorías semilla y una lista vacía de movimientos.
+      setCategorias(catGuardadas ? JSON.parse(catGuardadas) : SEED_CATEGORIAS);
+      setMovimientos(movGuardados ? JSON.parse(movGuardados) : []);
+    } catch (err) {
+      // Solo debería fallar si el JSON guardado quedó corrupto por alguna razón.
+      console.error("Error leyendo localStorage:", err);
+      setCategorias(SEED_CATEGORIAS);
+      setMovimientos([]);
+    }
   }, []);
 
-  const guardarCategorias = async (next) => {
+  // Estas dos funciones son el "punto único de guardado" de toda la app.
+  // Cada vez que agregas un movimiento, editas una categoría, importas un
+  // backup, etc., el código llama a una de estas dos — nunca escribe a
+  // localStorage directamente desde otro lado. Eso es bueno, mantenlo así:
+  // si el día de mañana cambias de localStorage a una API real, solo tocas
+  // estas dos funciones y todo el resto del componente sigue funcionando igual.
+
+  const guardarCategorias = (next) => {
+    // 1) Actualiza el estado de React -> la UI se re-renderiza al toque
     setCategorias(next);
     try {
-      const res = await window.storage.set(K_CATS, JSON.stringify(next), false);
-      if (!res) setError("No se pudo guardar. Intenta de nuevo.");
-      else setError(null);
-    } catch {
+      // 2) Persiste en localStorage -> sobrevive a recargas y cierres de pestaña
+      // JSON.stringify convierte el array a texto, porque localStorage
+      // SOLO puede guardar strings, nunca objetos/arrays directamente.
+      localStorage.setItem(K_CATS, JSON.stringify(next));
+      setError(null);
+    } catch (err) {
+      // Puede fallar en modo incógnito con storage bloqueado, o si se llena
+      // el límite de ~5MB de localStorage (poco probable con estos datos).
+      console.error("Error guardando categorías:", err);
       setError("No se pudo guardar. Intenta de nuevo.");
     }
   };
 
-  const guardarMovimientos = async (next) => {
+  const guardarMovimientos = (next) => {
     setMovimientos(next);
     try {
-      const res = await window.storage.set(K_MOVS, JSON.stringify(next), false);
-      if (!res) setError("No se pudo guardar. Intenta de nuevo.");
-      else setError(null);
-    } catch {
+      localStorage.setItem(K_MOVS, JSON.stringify(next));
+      setError(null);
+    } catch (err) {
+      console.error("Error guardando movimientos:", err);
       setError("No se pudo guardar. Intenta de nuevo.");
     }
   };
